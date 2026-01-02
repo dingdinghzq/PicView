@@ -1,0 +1,12 @@
+{
+  "name": "picview",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node server/index.js",
+    "build": "cd client && npm install && npm run build",
+    "server-install": "cd server && npm install"
+  },
+  "dependencies": {
+    "sharp": "^0.34.5"
+  }
+}
