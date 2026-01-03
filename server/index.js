@@ -1,11 +1,20 @@
 const express = require('express');
 const fs = require('fs-extra');
 const path = require('path');
+// const LibRaw = require('librawspeed'); // Moved to worker
 const sharp = require('sharp');
 const cors = require('cors');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const { promisify } = require('util');
 const runExecFile = promisify(execFile);
+
+let heicConvertPromise = null;
+async function getHeicConvert() {
+  if (!heicConvertPromise) {
+    heicConvertPromise = import('heic-convert').then((m) => m.default || m);
+  }
+  return heicConvertPromise;
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -262,8 +271,40 @@ async function ensureVideoTranscode(videoPath, folderName, videoName) {
 
 async function convertHeicToJpeg(sourcePath, destPath) {
   await fs.ensureDir(path.dirname(destPath));
-  // Use ffmpeg to decode HEIC/HEIF to high-quality JPEG.
-  await runExecFile('ffmpeg', ['-y', '-i', sourcePath, '-q:v', '2', destPath], { windowsHide: true });
+
+  if (await fs.pathExists(destPath)) return;
+
+  const tmpPath = `${destPath}.tmp`;
+
+  // If a temp file exists, assume a conversion is already running.
+  if (await fs.pathExists(tmpPath)) {
+    const timeoutMs = 60_000;
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (await fs.pathExists(destPath)) return;
+      if (!await fs.pathExists(tmpPath)) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+
+  try {
+    const convert = await getHeicConvert();
+    const inputBuffer = await fs.readFile(sourcePath);
+    const output = await convert({
+      buffer: inputBuffer,
+      format: 'JPEG',
+      quality: 0.8,
+    });
+
+    const outputBuffer = Buffer.isBuffer(output) ? output : Buffer.from(output);
+    await fs.writeFile(tmpPath, outputBuffer);
+    await fs.move(tmpPath, destPath, { overwrite: true });
+  } catch (err) {
+    if (await fs.pathExists(tmpPath)) {
+      await fs.remove(tmpPath).catch(() => {});
+    }
+    throw err;
+  }
 }
 
 // Resolve best source for an image request, handling DNG fallbacks and conversion.
@@ -294,15 +335,47 @@ async function resolveImageSource(folderName, imageName) {
     return { sourcePath: jpegCandidate };
   }
 
-  // No sibling JPEG: convert DNG to cached full-size JPEG with basic auto-balance.
+  // No sibling JPEG: convert DNG to cached full-size JPEG using dcraw (sharp often extracts only the preview).
   const fullCachePath = getImageCachePath(folderName, imageName, 'full');
   if (!await fs.pathExists(fullCachePath)) {
     await fs.ensureDir(path.dirname(fullCachePath));
-    await sharp(originalPath)
-      .rotate()
-      .normalize() // approximate auto light/white balance
-      .jpeg({ quality: 90, mozjpeg: true })
-      .toFile(fullCachePath);
+    
+    // Use librawspeed (via worker) for DNG conversion to get full resolution
+    try {
+      console.log('Converting DNG with librawspeed worker:', originalPath);
+      
+      const tempPpmPath = fullCachePath + '.ppm';
+      
+      // Run worker process
+      await runExecFile(process.execPath, [
+        path.join(__dirname, 'dng-worker.js'),
+        originalPath,
+        tempPpmPath
+      ]);
+      
+      if (!await fs.pathExists(tempPpmPath)) {
+        throw new Error('Worker failed to produce output');
+      }
+      
+      // Use sharp to convert PPM to JPEG (rotate, normalize)
+      await sharp(tempPpmPath)
+        .rotate()
+        .normalize()
+        .jpeg({ quality: 80, mozjpeg: true })
+        .toFile(fullCachePath);
+        
+      // Cleanup temp file
+      await fs.remove(tempPpmPath);
+        
+    } catch (err) {
+      console.error('Failed to convert DNG with librawspeed worker, falling back to sharp', err);
+      // Fallback to sharp if worker fails
+      await sharp(originalPath)
+        .rotate()
+        .normalize()
+        .jpeg({ quality: 80, mozjpeg: true })
+        .toFile(fullCachePath);
+    }
   }
 
   return { sourcePath: fullCachePath };
@@ -540,6 +613,23 @@ app.post('/api/rotate', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to rotate image' });
+  }
+});
+
+// Serve original file
+app.get('/api/original/*', async (req, res) => {
+  try {
+    const fullPath = req.params[0];
+    const imagePath = path.join(PHOTOS_DIR, fullPath);
+
+    if (!await fs.pathExists(imagePath)) {
+      return res.status(404).send('File not found');
+    }
+
+    res.sendFile(imagePath);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Error serving original file');
   }
 });
 
