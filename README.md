@@ -48,4 +48,28 @@ photos/
 -   **Image Viewer**:
     -   Pan and Zoom support.
     -   Keyboard navigation (Arrow keys).
-    -   Progressive loading (blur preview).
+  -   Progressive loading (blur preview).
+
+## RAW and HEIC Support
+
+-   DNG/RAW: processed with `librawspeed` (LibRaw) via a worker process for full-resolution output.
+-   HEIC/HEIF: handled with `heic-convert`.
+-   Baseline runtime: Node.js 22 (Dockerfile uses `node:22-slim`).
+
+## Docker
+
+-   Build image: `docker build -t picview:latest .`
+-   Save image: `docker save -o picview2.tar picview:latest`
+-   Load elsewhere: `docker load -i picview2.tar`
+-   Run: `docker run --rm -p 3001:3001 -v /host/photos:/photos -v /host/cache:/cache -e PHOTOS_DIR=/photos picview:latest`
+
+## Environment
+
+-   `PHOTOS_DIR` (default `/photos`)
+-   `PORT` (default `3001`)
+-   `CACHE` path (default `/cache` inside container)
+
+## Build Notes
+
+-   The Docker image compiles LibRaw 0.21.4 with `-fPIC` and links `librawspeed` against it; image includes ffmpeg and standard image codecs.
+-   Client is built during the Docker multi-stage build and copied into the server image.
