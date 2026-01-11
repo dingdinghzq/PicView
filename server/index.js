@@ -8,6 +8,76 @@ const { execFile, spawn } = require('child_process');
 const { promisify } = require('util');
 const runExecFile = promisify(execFile);
 
+function sharpFailOnNone(pipeline) {
+  // Older sharp versions don't have `.failOn()`.
+  if (pipeline && typeof pipeline.failOn === 'function') {
+    return pipeline.failOn('none');
+  }
+  return pipeline;
+}
+
+function getDefaultResizeOpts() {
+  return {
+    width: MAX_FULL_IMAGE_DIMENSION,
+    height: MAX_FULL_IMAGE_DIMENSION,
+    fit: 'inside',
+    withoutEnlargement: true,
+  };
+}
+
+async function getAutoLevelsParamsFromRaw(rawBuffer, rawOptions) {
+  // Approximate Lightroom-style "Auto" by stretching luminance between low/high percentiles.
+  // Runs only on cache misses.
+  const sample = await sharp(rawBuffer, { raw: rawOptions })
+    .resize({ width: 256, height: 256, fit: 'inside', withoutEnlargement: true })
+    .removeAlpha()
+    .greyscale()
+    .raw()
+    .toBuffer();
+
+  if (!sample || sample.length === 0) return null;
+
+  const hist = new Array(256).fill(0);
+  for (let i = 0; i < sample.length; i++) hist[sample[i]]++;
+
+  const total = sample.length;
+  const lowTarget = Math.floor(total * 0.01);
+  const highTarget = Math.floor(total * 0.99);
+
+  let cum = 0;
+  let low = 0;
+  for (let i = 0; i < 256; i++) {
+    cum += hist[i];
+    if (cum >= lowTarget) {
+      low = i;
+      break;
+    }
+  }
+
+  cum = 0;
+  let high = 255;
+  for (let i = 0; i < 256; i++) {
+    cum += hist[i];
+    if (cum >= highTarget) {
+      high = i;
+      break;
+    }
+  }
+
+  // Avoid extreme amplification.
+  low = Math.max(0, low - 2);
+  high = Math.min(255, high + 2);
+
+  if (high <= low + 5) return null;
+
+  // Keep some headroom to reduce highlight clipping.
+  const targetLow = 8;
+  const targetHigh = 245;
+  const scale = (targetHigh - targetLow) / (high - low);
+  const offset = targetLow - low * scale;
+  return { scale, offset, low, high, targetLow, targetHigh };
+}
+
 let heicConvertPromise = null;
 async function getHeicConvert() {
   if (!heicConvertPromise) {
@@ -237,13 +307,35 @@ async function ensureVideoTranscode(videoPath, folderName, videoName) {
   const cacheDir = path.join(PHOTOS_DIR, folderName, CACHE_FOLDER_NAME);
   const base = path.parse(videoName).name;
   const outPath = path.join(cacheDir, `${base}.h265.mp4`);
-  const tempPath = path.join(cacheDir, `${base}.h265.tmp.mp4`);
+  const lockPath = path.join(cacheDir, `${base}.h265.lock`);
+  const failPath = path.join(cacheDir, `${base}.h265.fail.json`);
 
   if (await fs.pathExists(outPath)) return outPath;
-  // If a temp file exists, assume a transcode is already running and skip starting another.
-  if (await fs.pathExists(tempPath)) return null;
-
   await fs.ensureDir(cacheDir);
+
+  // If a lock exists, assume a transcode is already running and skip starting another.
+  if (await fs.pathExists(lockPath)) return null;
+
+  // If we recently failed, don't keep retrying on every request.
+  if (await fs.pathExists(failPath)) {
+    try {
+      const fail = await fs.readJson(failPath);
+      const lastFailAt = typeof fail?.at === 'number' ? fail.at : 0;
+      const backoffMs = 10 * 60 * 1000;
+      if (Date.now() - lastFailAt < backoffMs) return null;
+    } catch {
+      // ignore
+    }
+  }
+
+  // Acquire lock (best-effort).
+  try {
+    await fs.writeFile(lockPath, JSON.stringify({ at: Date.now(), pid: process.pid }), { flag: 'wx' });
+  } catch {
+    return null;
+  }
+
+  const tempPath = path.join(cacheDir, `${base}.h265.tmp.${process.pid}.${Date.now()}.mp4`);
 
   try {
     await runExecFile('ffmpeg', [
@@ -257,15 +349,32 @@ async function ensureVideoTranscode(videoPath, folderName, videoName) {
       '-b:a', '128k',
       tempPath
     ], { windowsHide: true });
+
+    if (!await fs.pathExists(tempPath)) {
+      throw new Error(`ffmpeg completed but did not create output: ${tempPath}`);
+    }
+
     // only expose finalized file after successful transcode
     await fs.move(tempPath, outPath, { overwrite: true });
+    await fs.remove(failPath).catch(() => {});
     return outPath;
   } catch (err) {
-    console.error('ffmpeg transcode failed', err.message || err);
-    if (await fs.pathExists(tempPath)) {
-      await fs.remove(tempPath).catch(() => {});
+    const message = err?.message || String(err);
+    console.error('ffmpeg transcode failed', message);
+    const stderr = err && typeof err.stderr !== 'undefined' ? String(err.stderr) : '';
+    if (stderr) {
+      console.error('ffmpeg transcode stderr', stderr.slice(0, 2000));
+    }
+    try {
+      // Keep a short failure note so we don't retry constantly.
+      await fs.writeJson(failPath, { at: Date.now(), message }, { spaces: 0 });
+    } catch {
+      // ignore
     }
     return null;
+  } finally {
+    await fs.remove(lockPath).catch(() => {});
+    await fs.remove(tempPath).catch(() => {});
   }
 }
 
@@ -344,36 +453,72 @@ async function resolveImageSource(folderName, imageName) {
     try {
       console.log('Converting DNG with librawspeed worker:', originalPath);
       
-      const tempPpmPath = fullCachePath + '.ppm';
+      const tempRawPath = fullCachePath + '.raw';
       
       // Run worker process
       await runExecFile(process.execPath, [
         path.join(__dirname, 'dng-worker.js'),
         originalPath,
-        tempPpmPath
+        tempRawPath
       ]);
       
-      if (!await fs.pathExists(tempPpmPath)) {
+      if (!await fs.pathExists(tempRawPath)) {
         throw new Error('Worker failed to produce output');
       }
+
+      const metaPath = `${tempRawPath}.json`;
+      if (!await fs.pathExists(metaPath)) {
+        throw new Error('Worker failed to produce metadata');
+      }
+
+      const meta = await fs.readJson(metaPath);
+      const rawBuffer = await fs.readFile(tempRawPath);
+
+      const rawOptions = {
+        width: meta.width,
+        height: meta.height,
+        channels: meta.channels,
+      };
+
+      if (meta.bits && meta.bits > 8) {
+        rawOptions.depth = 'ushort';
+      }
+
+      const auto = await getAutoLevelsParamsFromRaw(rawBuffer, rawOptions);
       
-      // Use sharp to convert PPM to JPEG (rotate, normalize)
-      await sharp(tempPpmPath)
+      // Use sharp to convert raw RGB to JPEG, applying the same size/quality caps as other cached images.
+      let pipeline = sharpFailOnNone(sharp(rawBuffer, { raw: rawOptions }))
         .rotate()
-        .normalize()
-        .jpeg({ quality: 80, mozjpeg: true })
+        .normalize();
+
+      if (auto) {
+        pipeline = pipeline.linear(auto.scale, auto.offset);
+      }
+
+      if (typeof pipeline.gamma === 'function') {
+        // Lift midtones without pushing highlights as aggressively as brightness.
+        pipeline = pipeline.gamma(2.2);
+      }
+
+      await pipeline
+        .resize(getDefaultResizeOpts())
+        .jpeg({ quality: 75, mozjpeg: true })
         .toFile(fullCachePath);
         
       // Cleanup temp file
-      await fs.remove(tempPpmPath);
+      await fs.remove(tempRawPath);
+      await fs.remove(metaPath);
         
     } catch (err) {
       console.error('Failed to convert DNG with librawspeed worker, falling back to sharp', err);
       // Fallback to sharp if worker fails
-      await sharp(originalPath)
+      // Fallback: keep the same post-processing chain.
+      await sharpFailOnNone(sharp(originalPath))
         .rotate()
         .normalize()
-        .jpeg({ quality: 80, mozjpeg: true })
+        .gamma(2.2)
+        .resize(getDefaultResizeOpts())
+        .jpeg({ quality: 75, mozjpeg: true })
         .toFile(fullCachePath);
     }
   }

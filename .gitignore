@@ -1,4 +1,5 @@
 picview*.tar
+_dng*/
 
 # Dependencies
 node_modules/

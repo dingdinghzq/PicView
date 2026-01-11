@@ -20,6 +20,7 @@ RUN apt-get update \
 		curl \
 		libraw-dev \
 		libjpeg-dev \
+		zlib1g-dev \
 		libtiff-dev \
 		liblcms2-dev \
 	&& rm -rf /var/lib/apt/lists/*
@@ -35,51 +36,33 @@ RUN set -eux; \
 			fi; \
 		done
 
-# Build LibRaw from source with -fPIC for librawspeed
-RUN set -eux; \
-		mkdir -p /tmp/libraw && cd /tmp/libraw; \
-		curl -L -o libraw.tar.gz https://www.libraw.org/data/LibRaw-0.21.4.tar.gz; \
-		tar -xzf libraw.tar.gz; \
-		cd LibRaw-0.21.4; \
-		CFLAGS="-fPIC" CXXFLAGS="-fPIC" ./configure --disable-examples --disable-samples --disable-openmp; \
-		make -j"$(nproc)"; \
-		make install; \
-		ldconfig; \
-		cd /; rm -rf /tmp/libraw
 
-# Prepare LibRaw static library path expected by librawspeed build
-RUN set -eux; \
-		base="/app/server/node_modules/librawspeed/deps/LibRaw-Source/LibRaw-0.21.4/build/linux-x64/lib"; \
-		mkdir -p "$base"; \
-		if [ -f /usr/lib/x86_64-linux-gnu/libraw.a ]; then \
-			ln -sf /usr/lib/x86_64-linux-gnu/libraw.a "$base/libraw.a"; \
-		elif [ -f /usr/lib/x86_64-linux-gnu/libraw_r.a ]; then \
-			ln -sf /usr/lib/x86_64-linux-gnu/libraw_r.a "$base/libraw.a"; \
-		else \
-			echo "LibRaw static library not found" >&2; exit 1; \
-		fi
 
 # Install server dependencies
 COPY server/package*.json ./server/
 WORKDIR /app/server
 RUN set -eux; \
-		npm config set script-shell /bin/bash; \
-		npm install --production --ignore-scripts; \
-		cd node_modules/librawspeed; \
-		mkdir -p deps/LibRaw-Source/LibRaw-0.21.4/build/linux-x64/lib; \
-		if [ -f /usr/local/lib/libraw.a ]; then \
-			ln -sf /usr/local/lib/libraw.a deps/LibRaw-Source/LibRaw-0.21.4/build/linux-x64/lib/libraw.a; \
-		elif [ -f /usr/local/lib/libraw_r.a ]; then \
-			ln -sf /usr/local/lib/libraw_r.a deps/LibRaw-Source/LibRaw-0.21.4/build/linux-x64/lib/libraw.a; \
-		elif [ -f /usr/lib/x86_64-linux-gnu/libraw.a ]; then \
-			ln -sf /usr/lib/x86_64-linux-gnu/libraw.a deps/LibRaw-Source/LibRaw-0.21.4/build/linux-x64/lib/libraw.a; \
-		elif [ -f /usr/lib/x86_64-linux-gnu/libraw_r.a ]; then \
-			ln -sf /usr/lib/x86_64-linux-gnu/libraw_r.a deps/LibRaw-Source/LibRaw-0.21.4/build/linux-x64/lib/libraw.a; \
-		else \
-			echo "LibRaw static library not found" >&2; exit 1; \
-		fi; \
-		cd /app/server; \
-		npm rebuild librawspeed
+	npm config set script-shell /bin/bash; \
+	cd node_modules/librawspeed || true; \
+	cd /app/server; \
+	npm install --production --ignore-scripts; \
+	cd node_modules/librawspeed; \
+	# Link against system libraw.so (PIC) to avoid -fPIC issues with Debian's static libraw.a
+	node -e "const fs=require('fs');const p='binding.gyp';const j=JSON.parse(fs.readFileSync(p,'utf8'));const cond=j.targets[0].conditions;const linux=cond.find(c=>c[0]===\"OS=='linux'\");if(!linux)throw new Error('linux condition not found');const cfg=linux[1];cfg.libraries=['-lraw','-ljpeg','-lz','-ltiff','-llcms2'];fs.writeFileSync(p,JSON.stringify(j,null,2));"; \
+	cd /app/server; \
+	npm rebuild librawspeed --build-from-source || true; \
+	cd node_modules/librawspeed; \
+	npx --yes node-gyp rebuild; \
+	# Some librawspeed versions expect libraw_addon.node; others produce raw_addon.node.
+	if [ -f build/Release/raw_addon.node ] && [ ! -f build/Release/libraw_addon.node ]; then \
+		cp -f build/Release/raw_addon.node build/Release/libraw_addon.node; \
+	fi; \
+	if [ -f build/Release/libraw_addon.node ] && [ ! -f build/Release/raw_addon.node ]; then \
+		cp -f build/Release/libraw_addon.node build/Release/raw_addon.node; \
+	fi; \
+	cd /app/server; \
+	node -e "require('librawspeed')"; \
+	test -f node_modules/librawspeed/build/Release/raw_addon.node || test -f node_modules/librawspeed/build/Release/libraw_addon.node
 
 # Copy server source code
 COPY server/ ./

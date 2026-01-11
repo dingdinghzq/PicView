@@ -319,6 +319,12 @@ function FolderView() {
   const [subFolders, setSubFolders] = useState([]);
   const [selectedIndex, setSelectedIndex] = useState(null);
 
+  const parentFolderName = (() => {
+    const idx = folderName.lastIndexOf('/');
+    if (idx <= 0) return null;
+    return folderName.slice(0, idx);
+  })();
+
   useEffect(() => {
     // folderName is encoded by react-router, but we might need to double check
     // if it contains slashes, it should be fine as part of the URL path if encoded
@@ -355,7 +361,12 @@ function FolderView() {
 
   return (
     <div className="container">
-      <Link to="/" style={{ color: 'white', textDecoration: 'none', display: 'inline-block', marginBottom: '20px' }}>&larr; Back to Folders</Link>
+      <Link
+        to={parentFolderName ? `/folder/${encodeURIComponent(parentFolderName)}` : '/'}
+        style={{ color: 'white', textDecoration: 'none', display: 'inline-block', marginBottom: '20px' }}
+      >
+        &larr; Back to Folders
+      </Link>
       <h1>{folderName}</h1>
       
       {subFolders.length > 0 && (
