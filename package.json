@@ -4,7 +4,8 @@
   "scripts": {
     "start": "node server/index.js",
     "build": "cd client && npm install && npm run build",
-    "server-install": "cd server && npm install"
+    "server-install": "cd server && npm install",
+    "preprocess": "node server/preprocess-offline.js"
   },
   "dependencies": {
     "heic-convert": "^2.1.0",

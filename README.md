@@ -67,7 +67,15 @@ photos/
 
 -   `PHOTOS_DIR` (default `/photos`)
 -   `PORT` (default `3001`)
--   `CACHE` path (default `/cache` inside container)
+-   Cache output is written under each folder: `<folder>/983db650f7f79bc8e87d9a3ba418aefc/`
+-   `PICVIEW_TRANSCODE_MIN_BYTES` (optional): skip video transcode when file size is <= this many bytes
+
+## Offline Preprocessing
+
+Pre-generate the same cached variants as the online API:
+
+-   `npm run preprocess` (or `node server/preprocess-offline.js`)
+-   Flags: `--concurrency N`, `--dry-run`
 
 ## Build Notes
 
