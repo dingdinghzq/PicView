@@ -387,7 +387,7 @@ app.post('/api/rotate', async (req, res) => {
     const tempPath = path.join(tempDir, `rotate_${Date.now()}_${path.basename(imageName)}`);
 
     // Rotate 90 degrees clockwise and preserve metadata
-    await sharp(imagePath)
+    await sharp(imagePath, { failOn: 'none' })
       .rotate(90)
       .withMetadata()
       .toFile(tempPath);

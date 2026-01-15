@@ -59,6 +59,13 @@ function sharpFailOnNone(pipeline) {
   return pipeline;
 }
 
+function sharpOpen(input, options) {
+  // Prefer constructor option (covers early decode warnings), then also apply the chain method when available.
+  const opts = options ? { ...options } : {};
+  if (opts.failOn === undefined) opts.failOn = 'none';
+  return sharpFailOnNone(sharp(input, opts));
+}
+
 function getDefaultResizeOpts(maxFullImageDimension) {
   return {
     width: maxFullImageDimension,
@@ -71,7 +78,7 @@ function getDefaultResizeOpts(maxFullImageDimension) {
 async function getAutoLevelsParamsFromRaw(rawBuffer, rawOptions) {
   // Approximate Lightroom-style "Auto" by stretching luminance between low/high percentiles.
   // Runs only on cache misses.
-  const sample = await sharp(rawBuffer, { raw: rawOptions })
+  const sample = await sharpOpen(rawBuffer, { raw: rawOptions })
     .resize({ width: 256, height: 256, fit: 'inside', withoutEnlargement: true })
     .removeAlpha()
     .greyscale()
@@ -336,7 +343,7 @@ function createMediaPreprocessor(options) {
 
         const auto = await getAutoLevelsParamsFromRaw(rawBuffer, rawOptions);
 
-        let pipeline = sharpFailOnNone(sharp(rawBuffer, { raw: rawOptions }))
+        let pipeline = sharpOpen(rawBuffer, { raw: rawOptions })
           .rotate()
           .normalize();
 
@@ -366,7 +373,7 @@ function createMediaPreprocessor(options) {
       } catch (err) {
         // Fallback to sharp if worker fails
         await writeJpegWithRetries(
-          () => sharpFailOnNone(sharp(originalPath))
+          () => sharpOpen(originalPath)
             .rotate()
             .normalize()
             .gamma(2.2)
@@ -437,7 +444,7 @@ function createMediaPreprocessor(options) {
       try {
         const pngBuffer = await convertHeicToPngBuffer(sourcePath);
         await writeJpegWithRetries(
-          () => sharpFailOnNone(sharp(pngBuffer))
+          () => sharpOpen(pngBuffer)
             .rotate()
             .resize(resizeOpts)
             .jpeg({ quality: 75, mozjpeg: true }),
@@ -449,7 +456,7 @@ function createMediaPreprocessor(options) {
         const notHeic = msg.includes('not a heic') || msg.includes('not a heif') || msg.includes('not a heif/heic');
         if (notHeic || await isJpegByMagic(sourcePath)) {
           await writeJpegWithRetries(
-            () => sharp(sourcePath)
+            () => sharpOpen(sourcePath)
               .rotate()
               .resize(resizeOpts)
               .jpeg({ quality: 75, mozjpeg: true }),
@@ -461,7 +468,7 @@ function createMediaPreprocessor(options) {
       }
     } else {
       await writeJpegWithRetries(
-        () => sharp(sourcePath)
+        () => sharpOpen(sourcePath)
           .rotate()
           .resize(resizeOpts)
           .jpeg({ quality: 75, mozjpeg: true }),
